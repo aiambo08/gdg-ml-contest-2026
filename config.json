@@ -1,0 +1,21 @@
+{
+ "run": "e5_long",
+ "channels": [
+  0,
+  1,
+  2,
+  3
+ ],
+ "mode": "dec",
+ "k": 8.0,
+ "med3": 0,
+ "kernels": [
+  7,
+  7,
+  5,
+  5
+ ],
+ "n_layers": 4,
+ "use_sr": false,
+ "epoch": 30
+}
