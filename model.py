@@ -1,4 +1,13 @@
-"""GDG UAM ML Contest submission: small 1-D CNN, numpy-only inference.
+"""GDG UAM ML Contest submission: small 1-D CNN, numpy-only inference (v2, latency-optimised).
+
+Same weights and same float32 arithmetic as v1 (logits are bit-identical); the per-sample work is
+reorganised to make far fewer numpy calls:
+- gap filling works on the few masked runs (typically ~4 per sample) instead of the whole (C, T) array;
+- preallocated, zero-padded activation buffers per (sample_rate, layer); the im2col matrix is a fixed
+  strided view of the buffer, so each conv is a single matmul into a preallocated output;
+- max-pool is done before bias and ReLU (exactly equivalent: rounding is monotonic) and writes straight
+  into the next layer's buffer;
+- cheap min/max/sum checks skip the NaN mask and the despike work when they cannot change anything.
 
 Files next to this one: weights.npz (BatchNorm folded into the convolutions) and config.json.
 Pipeline per sample: NaN interpolation -> robust z (median, IQR/1.349) per channel -> despike (|z|>k ->
@@ -7,9 +16,11 @@ re-interpolate, clip) -> sr=2 decimated x2 (mode 'dec') -> CNN -> argmax.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import numpy as np
+from numpy.lib.stride_tricks import as_strided
 
 try:
     from competition_api import Sample  # noqa: F401
@@ -17,29 +28,53 @@ except Exception:  # pragma: no cover
     Sample = object
 
 HERE = Path(__file__).resolve().parent
-_AR = np.arange(256)
+_IQR = np.float32(1.349)
+_EPS = np.float32(1e-3)
+_Q75 = np.float32(0.75)
+_Q25 = np.float32(0.25)
+_HALF = np.float32(0.5)
+_LOHI = (63, 191)                      # linear-interpolated quartiles at 25 % and 75 % for T = 256
 
 
-def _fill_nan(x, nanm):
-    """Vectorised linear interpolation of NaN along axis 1 (same result as np.interp: ends take the
-    nearest valid value, an all-NaN row becomes 0). x (C,T) float32, modified in place."""
-    C, T = x.shape
-    ar = _AR[:T]
-    prev = np.maximum.accumulate(np.where(nanm, -1, ar), axis=1)
-    nxt = np.minimum.accumulate(np.where(nanm, T, ar)[:, ::-1], axis=1)[:, ::-1]
-    r, c = np.nonzero(nanm)
-    p = prev[r, c]
-    n = nxt[r, c]
-    pc = np.maximum(p, 0)
-    nc = np.minimum(n, T - 1)
-    xp = x[r, pc]
-    xn = x[r, nc]
-    den = np.maximum(n - p, 1)
-    v = xp + (xn - xp) * ((c - p) / den).astype(np.float32)
-    v = np.where(p < 0, xn, v)
-    v = np.where(n >= T, xp, v)
-    v = np.where((p < 0) & (n >= T), 0.0, v)
-    x[r, c] = v
+def _fill_runs(x, pos):
+    """Linear interpolation of the entries at flat positions `pos` (sorted) of x (C, T), row by row, in
+    place. Same float32 arithmetic as v1's vectorised version (and np.interp's rule): interior runs take
+    xp + (xn - xp) * f32((c - p) / (n - p)); runs touching an end take the nearest valid value; a fully
+    masked row becomes 0."""
+    T = x.shape[1]
+    xf = x.reshape(-1)                 # view (x is C-contiguous)
+    P = pos.tolist()
+    m = len(P)
+    ipos, ipc, inc, num, den = [], [], [], [], []
+    i = 0
+    while i < m:
+        s = P[i]
+        r = s // T
+        j = i
+        lim = r * T + T - 1
+        while j + 1 < m and P[j + 1] == P[j] + 1 and P[j] < lim:
+            j += 1
+        e = P[j]
+        base = r * T
+        p = s - base - 1               # previous valid column (-1: none)
+        q = e - base + 1               # next valid column (T: none)
+        if p < 0 and q >= T:
+            xf[s:e + 1] = 0.0
+        elif p < 0:
+            xf[s:e + 1] = xf[base + q]
+        elif q >= T:
+            xf[s:e + 1] = xf[base + p]
+        else:
+            d = q - p
+            for c in range(s - base, e - base + 1):
+                ipos.append(base + c); ipc.append(base + p); inc.append(base + q)
+                num.append(c - p); den.append(d)
+        i = j + 1
+    if ipos:
+        xp = xf[ipc]
+        xn = xf[inc]
+        t = (np.array(num) / np.array(den)).astype(np.float32)
+        xf[ipos] = xp + (xn - xp) * t
     return x
 
 
@@ -50,27 +85,40 @@ def median3(x):
     return a + x + c - np.maximum(np.maximum(a, x), c) - np.minimum(np.minimum(a, x), c)
 
 
-def preprocess(series, sr, channels, mode, k, med3=False):
-    x = np.array(series if channels is None else series[channels], np.float32, order="C")   # (C,256) copy
-    nanm = ~np.isfinite(x)                    # NaN and +-inf are both treated as missing
-    if nanm.any():
-        _fill_nan(x, nanm)
-    s = np.sort(x, axis=1)                    # exact np.percentile (linear) at 25/50/75 for T=256
-    q1 = s[:, 63] + 0.75 * (s[:, 64] - s[:, 63])
-    med = 0.5 * (s[:, 127] + s[:, 128])
-    q3 = s[:, 191] + 0.25 * (s[:, 192] - s[:, 191])
-    rs = np.maximum((q3 - q1) / np.float32(1.349), np.float32(1e-3))
-    x -= med[:, None]
-    x /= rs[:, None]
-    spk = np.abs(x) > k
-    if spk.any():
-        _fill_nan(x, spk)
-    np.clip(x, -k, k, out=x)
-    if med3:
-        x = median3(x)
-    if mode == "dec" and sr == 2:
-        x = x.reshape(x.shape[0], -1, 2).mean(-1)
-    return x
+class _Plan:
+    """Preallocated buffers and fixed views for one input length (one per sample_rate)."""
+
+    def __init__(self, layers, cin0, L0):
+        self.steps = []
+        L, C = L0, cin0
+        n = len(layers)
+        ins = []
+        for i, (W, b, kk) in enumerate(layers):
+            p = kk // 2
+            buf = np.zeros((L + 2 * p, C), np.float32)
+            s0, s1 = buf.strides
+            # (L, kk, C) strided view -> (L, kk*C) rows ordered (tap, cin), as the weights expect.
+            # Merging (kk, C) is stride-compatible, so this stays a view of buf (no copy per call).
+            cols = as_strided(buf, (L, kk, C), (s0, s0, s1), writeable=False).reshape(L, kk * C)
+            assert np.shares_memory(cols, buf)
+            ins.append(buf[p:p + L])
+            cout = W.shape[1]
+            out = np.empty((L, cout), np.float32)
+            self.steps.append([cols, W, b, out, None, None, None])
+            C = cout
+            if i < n - 1:
+                L = L // 2
+        for i in range(n - 1):
+            st = self.steps[i]
+            out = st[3]
+            L2 = ins[i + 1].shape[0]
+            st[4], st[5], st[6] = out[0:2 * L2:2], out[1:2 * L2:2], ins[i + 1]
+        self.h0 = ins[0]
+        self.last = self.steps[-1]
+        self.body = self.steps[:-1]
+        self.Lout = L
+        self.feat = np.empty(2 * C, np.float32)
+        self.fmean, self.fmax = self.feat[:C], self.feat[C:]
 
 
 class Model:
@@ -83,50 +131,82 @@ class Model:
         self.use_sr = bool(cfg["use_sr"])
         w = np.load(HERE / "weights.npz")
         n = cfg["n_layers"]
-        # conv weights as (Cin*k, Cout) for (L, Cin*k) @ W ; activations kept as (L, C)
         self.layers = []
         for i in range(n):
             W = w[f"w{i}"]                       # (Cout, Cin, k)
             cout, cin, kk = W.shape
             Wk = W.transpose(0, 2, 1).reshape(cout, kk * cin).T          # rows ordered (tap, cin)
-            self.layers.append((np.ascontiguousarray(Wk), w[f"b{i}"].astype(np.float32), kk))
+            self.layers.append((np.ascontiguousarray(Wk, np.float32), w[f"b{i}"].astype(np.float32), kk))
         self.hw = np.ascontiguousarray(w["hw"].T)
         self.hb = w["hb"]
+        cin0 = 4 if self.ch is None else len(self.ch)
+        self._plans = {1: _Plan(self.layers, cin0, 256)}
+        if self.mode == "dec":
+            self._plans[2] = _Plan(self.layers, cin0, 128)
 
-    def _forward_np(self, x, sr):
-        h = x.T                                   # (L, C)
-        n = len(self.layers)
-        for i, (W, b, kk) in enumerate(self.layers):
-            L, C = h.shape
-            p = kk // 2
-            hp = np.zeros((L + 2 * p, C), np.float32)
-            hp[p:p + L] = h
-            cols = np.concatenate([hp[j:j + L] for j in range(kk)], axis=1)   # (L, k*C)
-            h = cols @ W
-            h += b
-            np.maximum(h, 0, out=h)
-            if i < n - 1:
-                L2 = L // 2
-                h = h[:2 * L2].reshape(L2, 2, -1).max(1)
-        f = np.concatenate([h.mean(0), h.max(0)])
-        if self.use_sr:
-            f = np.append(f, np.float32(sr - 1.5))
-        return f @ self.hw + self.hb
+    # ---------------------------------------------------------------- preprocessing, (C, T) layout
+    def _prep(self, series):
+        x = np.array(series if self.ch is None else series[self.ch], np.float32, order="C")  # (C,256)
+        if not math.isfinite(float(x.sum())):    # NaN / +-inf (or a harmless overflow: mask is exact)
+            pos = np.flatnonzero(~np.isfinite(x))
+            if len(pos):
+                _fill_runs(x, pos)
+        s = np.sort(x, axis=1)                    # exact np.percentile (linear) at 25/50/75 for T=256
+        q1 = s[:, 63] + _Q75 * (s[:, 64] - s[:, 63])
+        med = _HALF * (s[:, 127] + s[:, 128])
+        q3 = s[:, 191] + _Q25 * (s[:, 192] - s[:, 191])
+        rs = np.maximum((q3 - q1) / _IQR, _EPS)
+        x -= med[:, None]
+        x /= rs[:, None]
+        k = self.k
+        if not (-k <= x.min() and x.max() <= k):  # also taken when x holds NaN: the mask is exact
+            pos = np.flatnonzero(np.abs(x) > k)
+            if len(pos):
+                _fill_runs(x, pos)
+            np.clip(x, -k, k, out=x)              # a no-op whenever this branch is skipped
+        if self.med3:
+            x = median3(x)
+        return x
 
     def logits(self, x) -> np.ndarray:
         try:
             sr = int(round(float(x.meta.get("sample_rate", 1))))
         except (TypeError, ValueError):
             sr = 1
-        z = preprocess(x.series, sr, self.ch, self.mode, self.k, self.med3)
-        return self._forward_np(z, sr)
+        z = self._prep(x.series)
+        if self.mode == "dec" and sr == 2:        # mean of pairs == (a + b) * 0.5 exactly
+            plan = self._plans[2]
+            zt = z.T
+            h0 = plan.h0
+            np.add(zt[0::2], zt[1::2], out=h0)
+            h0 *= _HALF
+        else:
+            plan = self._plans[1]
+            np.copyto(plan.h0, z.T)
+        mm, mx, add = np.matmul, np.maximum, np.add
+        for cols, W, b, out, ev, od, nxt in plan.body:
+            mm(cols, W, out=out)
+            mx(ev, od, out=nxt)                   # max-pool, then bias + ReLU (identical to v1's order)
+            add(nxt, b, out=nxt)
+            mx(nxt, 0, out=nxt)
+        cols, W, b, h = plan.last[:4]
+        mm(cols, W, out=h)
+        add(h, b, out=h)
+        mx(h, 0, out=h)
+        add.reduce(h, axis=0, out=plan.fmean)     # == h.mean(0): same pairwise sum, then / L
+        np.true_divide(plan.fmean, plan.Lout, out=plan.fmean)
+        mx.reduce(h, axis=0, out=plan.fmax)
+        f = plan.feat
+        if self.use_sr:
+            f = np.append(f, np.float32(sr - 1.5))
+        return f @ self.hw + self.hb
 
     def predict(self, x) -> int:
         # Any failure abstains: an abstention scores better than a sure wrong answer.
         try:
             out = self.logits(x)
+            if not math.isfinite(float(out.sum())):
+                return -1
+            return int(out.argmax())
         except Exception:
             return -1
-        if not np.isfinite(out).all():
-            return -1
-        return int(np.argmax(out))
