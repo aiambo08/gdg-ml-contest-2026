@@ -1,5 +1,5 @@
 {
- "run": "e5_long",
+ "run": "runs/gbn_s6/last.pt",
  "channels": [
   0,
   1,
@@ -17,5 +17,7 @@
  ],
  "n_layers": 4,
  "use_sr": false,
- "epoch": 30
+ "srbn": true,
+ "gbn": true,
+ "epoch": 35
 }
