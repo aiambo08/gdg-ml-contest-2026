@@ -1,5 +1,5 @@
 {
- "run": "runs/gbn_s6/last.pt",
+ "run": "runs/kdgp_s6/last.pt",
  "channels": [
   0,
   1,
@@ -19,5 +19,5 @@
  "use_sr": false,
  "srbn": true,
  "gbn": true,
- "epoch": 35
+ "epoch": 71
 }
